@@ -25,8 +25,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <endian.h>
+#include <time.h>
 #include <sys/types.h>
-#include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -799,7 +799,7 @@ struct shard_ctx
     struct writer *wr;
 
     off_t total_size;
-    struct timeval start_time;
+    time_t start_time;
 
     char *keybuf;
     size_t keybuflen;
@@ -814,20 +814,24 @@ static void shard_progress_update(struct shard_ctx *ctx)
     
     float percent = 100.f * (float)processed_size / (float)ctx->total_size;
 
-    struct timeval now;
-    if(-1 == gettimeofday(&now, NULL))
-        errmsg("gettimeofday: %m");
-
-    int elapsed = now.tv_sec - ctx->start_time.tv_sec,
-        eta = (int)((float)remaining_size / (float)processed_size * (float)elapsed);
+    time_t now = time(NULL);
+    int elapsed = now - ctx->start_time;
 
     char total_buf[16], processed_buf[16], rate_buf[16];
     fmt_filesize(total_buf, ctx->total_size);
     fmt_filesize(processed_buf, processed_size);
-    fmt_filesize(rate_buf, processed_size / elapsed);
 
-    printf("\033[K%6.2f%% done; processed %s of %s; elapsed time %02dm%02ds; %s/sec; eta %02dm%02ds\r",
-           percent, processed_buf, total_buf, elapsed / 60, elapsed % 60, rate_buf, eta / 60, eta % 60);
+    printf("\033[K%6.2f%% done; processed %s of %s; elapsed time %02dm%02ds",
+           percent, processed_buf, total_buf, elapsed / 60, elapsed % 60);
+
+    if(processed_size > 0 && elapsed > 0)
+    {
+        int eta = (float)remaining_size / (float)processed_size * (float)elapsed;
+        fmt_filesize(rate_buf, processed_size / elapsed);
+        printf("; %s/sec; eta %02dm%02ds", rate_buf, eta / 60, eta % 60);
+    }
+
+    putchar('\r');
     fflush(stdout);
 }
 
@@ -981,11 +985,11 @@ static void shard(struct shard_ctx *ctx)
                 ctx->rd_count, totalsize, ctx->wr_count,
                 hashfn_name(ctx->hfn), shardfn_name(ctx->sfn),
                 maxver);
-        
-        if(-1 == gettimeofday(&ctx->start_time, NULL))
-            errmsg("gettimeofday: %m");
+       
+        ctx->start_time = time(NULL); 
 
         start_progress_timer();
+        shard_progress_update(ctx);
     }
 
     int crc_enable = rdb_has_checksum(maxver);
@@ -1035,8 +1039,9 @@ static void shard(struct shard_ctx *ctx)
     }
 
     if(!is_quiet()) {
+        shard_progress_update(ctx);
         stop_progress_timer();
-        printf("completed successfully.\n");
+        printf("\ncompleted successfully.\n");
     }
 }
 
