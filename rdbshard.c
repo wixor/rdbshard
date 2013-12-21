@@ -201,6 +201,11 @@ static int ketama_dispatch(shardfn_t sfn, hash_t hash)
     const struct ketama *ketama = (const struct ketama *)sfn;
 
     int p = 0, q = ketama->n_points;
+
+    if(ketama->points[0].hash >= hash ||
+       ketama->points[q-1].hash < hash)
+        return ketama->points[0].idx;
+
     while(q-p > 1) {
         int m = (p+q)/2;
         if(ketama->points[m].hash < hash)
@@ -209,9 +214,7 @@ static int ketama_dispatch(shardfn_t sfn, hash_t hash)
             q = m;
     }
 
-    return q < ketama->n_points
-              ? ketama->points[q].idx
-              : ketama->points[0].idx;
+    return ketama->points[q].idx;
 }
 
 static void ketama_free(shardfn_t sfn)
