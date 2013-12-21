@@ -26,9 +26,11 @@
 #include <errno.h>
 #include <endian.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "lzf.h"
 #include "md5.h"
@@ -39,11 +41,11 @@ uint64_t crc64(uint64_t crc, const unsigned char *s, size_t l);
 
 typedef uint32_t hash_t;
 
-typedef hash_t (*hashfn_t)(const void *key, size_t keylen);
 struct hashfn_descriptor {
     const char *name;
-    hashfn_t fn;
+    hash_t (*fn)(const void *key, size_t keylen);
 };
+typedef const struct hashfn_descriptor *hashfn_t;
 
 static const struct hashfn_descriptor fnv1a_64_descriptor; /* forward decl */
 static const struct hashfn_descriptor * const all_hashfns[] = {
@@ -59,12 +61,19 @@ static hashfn_t hashfn_init(const char *name)
 
     while(*ret != NULL)
         if(0 == strcmp((*ret)->name, name))
-            return (*ret)->fn;
+            return *ret;
         else
             ret++;
 
     errno = ENOENT;
     return NULL;
+}
+
+static inline const char *hashfn_name(hashfn_t hfn) {
+    return hfn->name;
+}
+static inline hash_t hashfn_hash(hashfn_t hfn, const void *key, size_t keylen) {
+    return hfn->fn(key, keylen);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -98,6 +107,9 @@ static shardfn_t shardfn_init(const char *name, const char *node_names[], int no
 
     errno = ENOENT;
     return NULL;
+}
+static inline const char *shardfn_name(shardfn_t sfn) {
+    return (*sfn)->name;
 }
 static inline int shardfn_dispatch(shardfn_t sfn, hash_t hash) {
     return (*sfn)->dispatch(sfn, hash);
@@ -233,7 +245,7 @@ static const struct shardfn_descriptor ketama_descriptor = {
 
 /* ------------------------------------------------------------------------- */
 
-enum { IO_BUFFER_SIZE = 4096 };
+enum { IO_BUFFER_SIZE = 3*4096 };
 
 struct reader
 {
@@ -249,6 +261,7 @@ struct writer
 {
     int fd;
     char *buf, *ptr, *mid, *end;
+    int crc_enable;
     uint64_t crc64;
 };
 
@@ -314,8 +327,11 @@ static ssize_t reader_ahead(struct reader *rd, size_t n)
             read_chunk = (size_t)(rd->end - rd->wrptr);
 
         ssize_t rc = read(rd->fd, rd->wrptr, read_chunk);
-        if(-1 == rc)
+        if(-1 == rc) {
+            if(EINTR == errno)
+                continue;
             return -1;
+        }
         if(0 == rc)
             break;
 
@@ -355,7 +371,24 @@ static int writer_init(struct writer *wr, int fd)
     wr->ptr = wr->buf;
     wr->mid = wr->buf + IO_BUFFER_SIZE;
     wr->end = wr->buf + 2*IO_BUFFER_SIZE;
+    wr->crc_enable = 1;
     wr->crc64 = 0;
+    return 0;
+}
+
+static int writer_loop(int fd, const char *p, const char *q)
+{
+    while(p < q)
+    {
+        ssize_t rc = write(fd, p, q-p);
+        if(-1 == rc) {
+            if(EINTR == errno)
+                continue;
+            return -1;
+        }
+        p += rc;
+    }
+
     return 0;
 }
 
@@ -364,7 +397,7 @@ static int writer_flush(struct writer *wr)
     if(wr->ptr == wr->buf)
         return 0;
    
-    if(-1 == write(wr->fd, wr->buf, wr->ptr - wr->buf))
+    if(-1 == writer_loop(wr->fd, wr->buf, wr->ptr))
         return -1;
     
     wr->ptr = wr->buf;
@@ -373,7 +406,8 @@ static int writer_flush(struct writer *wr)
 
 static int writer_write(struct writer *wr, const void *buf, size_t n)
 {
-    wr->crc64 = crc64(wr->crc64, buf, n);
+    if(wr->crc_enable)
+        wr->crc64 = crc64(wr->crc64, buf, n);
 
     if(wr->ptr + n <= wr->end) {
         memcpy(wr->ptr, buf, n);
@@ -385,11 +419,7 @@ static int writer_write(struct writer *wr, const void *buf, size_t n)
         if(-1 == writer_flush(wr))
             return -1;
 
-    if(n > 0)
-        if(-1 == write(wr->fd, buf, n))
-            return -1;
-
-    return 0;
+    return writer_loop(wr->fd, buf, buf+n);
 }
 
 static inline void writer_free(struct writer *wr) {
@@ -574,8 +604,11 @@ static rdb_ver_t rdb_check_header(struct reader *rd)
 
     return strtol(verbuf, NULL, 10);
 }
-static void rdb_write_header(struct writer *wr) {
-    if(-1 == writer_write(wr, "REDIS0006", 9))
+static void rdb_write_header(struct writer *wr, rdb_ver_t ver)
+{
+    char buf[16];
+    int n = sprintf(buf, "REDIS%04d", ver);
+    if(-1 == writer_write(wr, buf, n))
         failerr("writer_write");
 }
 
@@ -657,7 +690,7 @@ struct rdb_string_fmt {
 };
 static int rdb_string_memcpy(void *out, const void *in, const struct rdb_string_fmt *fmt) {
     memcpy(out, in, fmt->encbytes);
-    ((char *)out)[fmt->decbytes-1] = '\0';
+    ((char *)out)[fmt->decbytes] = '\0';
     return 0;
 }
 static int rdb_string_int8(void *out, const void *in, const struct rdb_string_fmt *fmt) {
@@ -670,9 +703,9 @@ static int rdb_string_int32(void *out, const void *in, const struct rdb_string_f
     (void)fmt; sprintf(out, "%d", (int)*(int32_t *)in); return 0;
 }
 static int rdb_string_lzf(void *out, const void *in, const struct rdb_string_fmt *fmt) {
-    if(lzf_decompress(in, fmt->encbytes, out, fmt->decbytes-1) != fmt->decbytes-1)
+    if(lzf_decompress(in, fmt->encbytes, out, fmt->decbytes) != fmt->decbytes)
         return -1;
-    ((char *)out)[fmt->decbytes-1] = '\0';
+    ((char *)out)[fmt->decbytes] = '\0';
     return 0;
 }
 static void rdb_read_string_header(struct reader *rd, struct rdb_string_fmt *fmt)
@@ -685,19 +718,19 @@ static void rdb_read_string_header(struct reader *rd, struct rdb_string_fmt *fmt
 
     if(!special) {
         fmt->encbytes = hdr;
-        fmt->decbytes = hdr+1; /* + '\0' */
+        fmt->decbytes = hdr;
         fmt->xfer = rdb_string_memcpy;
     } else if(REDIS_RDB_ENC_INT8 == hdr) {
         fmt->encbytes = 1;
-        fmt->decbytes = 5; /* "-128" 4 bytes + '\0' */
+        fmt->decbytes = 4; /* "-128" 4 bytes */
         fmt->xfer = rdb_string_int8;
     } else if(REDIS_RDB_ENC_INT16 == hdr) {
         fmt->encbytes = 2;
-        fmt->decbytes = 7; /* "-32768" 6 bytes + '\0' */
+        fmt->decbytes = 6; /* "-32768" 6 bytes */
         fmt->xfer = rdb_string_int16;
     } else if(REDIS_RDB_ENC_INT32 == hdr) {
         fmt->encbytes = 4;
-        fmt->decbytes = 12; /* "-2147483648" 11 bytes + '\0' */
+        fmt->decbytes = 11; /* "-2147483648" 11 bytes */
         fmt->xfer = rdb_string_int32;
     }
     else if(REDIS_RDB_ENC_LZF == hdr)
@@ -711,7 +744,6 @@ static void rdb_read_string_header(struct reader *rd, struct rdb_string_fmt *fmt
             failerr("funnyint_read");
         if(special)
             failure("%s: malformed rdb file (lzf uncompressed length is a special funnyint)", rd->name);
-        fmt->decbytes += 1; /* + '\0' */
 
         fmt->xfer = rdb_string_lzf;
     }
@@ -719,7 +751,7 @@ static void rdb_read_string_header(struct reader *rd, struct rdb_string_fmt *fmt
         failure("%s: malformed rdb file (unknown string storage method)", rd->name);
 }
 
-static void rdb_read_string(struct reader *rd, char **bufp, size_t *buflenp)
+static int rdb_read_string(struct reader *rd, char **bufp, size_t *buflenp)
 {
     struct rdb_string_fmt fmt;
     rdb_read_string_header(rd, &fmt);
@@ -727,9 +759,9 @@ static void rdb_read_string(struct reader *rd, char **bufp, size_t *buflenp)
     char *buf = *bufp;
     size_t buflen = *buflenp;
 
-    if(buflen < fmt.decbytes)
+    if(buflen < fmt.decbytes+1)
     {
-        buflen = (fmt.decbytes < 2*buflen) ? 2*buflen : fmt.decbytes;
+        buflen = (fmt.decbytes+1 < 2*buflen) ? 2*buflen : fmt.decbytes+1;
 
         buf = realloc(buf, buflen);
         if(NULL == buf)
@@ -742,22 +774,62 @@ static void rdb_read_string(struct reader *rd, char **bufp, size_t *buflenp)
     rdb_need(rd, fmt.encbytes, "truncated rdb file (string data not long enough)");
     fmt.xfer(buf, rd->rdptr, &fmt);
     reader_advance(rd, fmt.encbytes);
+
+    return fmt.decbytes;
 }
 
 /* ------------------------------------------------------------------------- */
+
+/* forward decls of some utilities not directly related to sharding process */
+static void fmt_filesize(char *buf, off_t size); 
+
+static inline int is_quiet();
+
+static void start_progress_timer();
+static inline int need_progress_update();
+static void stop_progress_timer();
 
 struct shard_ctx
 {
     hashfn_t hfn;
     shardfn_t sfn;
-
+    
     int rd_count, wr_count;
     struct reader *rd;
     struct writer *wr;
 
-    char *keyname;
-    size_t keylen;
+    off_t total_size;
+    struct timeval start_time;
+
+    char *keybuf;
+    size_t keybuflen;
 };
+
+static void shard_progress_update(struct shard_ctx *ctx)
+{
+    off_t processed_size = 0;
+    for(int i=0; i<ctx->rd_count; i++)
+        processed_size += ctx->rd[i].processed_size;
+    off_t remaining_size = ctx->total_size - processed_size;
+    
+    float percent = 100.f * (float)processed_size / (float)ctx->total_size;
+
+    struct timeval now;
+    if(-1 == gettimeofday(&now, NULL))
+        errmsg("gettimeofday: %m");
+
+    int elapsed = now.tv_sec - ctx->start_time.tv_sec,
+        eta = (int)((float)remaining_size / (float)processed_size * (float)elapsed);
+
+    char total_buf[16], processed_buf[16], rate_buf[16];
+    fmt_filesize(total_buf, ctx->total_size);
+    fmt_filesize(processed_buf, processed_size);
+    fmt_filesize(rate_buf, processed_size / elapsed);
+
+    printf("\033[K%6.2f%% done; processed %s of %s; elapsed time %02dm%02ds; %s/sec; eta %02dm%02ds\r",
+           percent, processed_buf, total_buf, elapsed / 60, elapsed % 60, rate_buf, eta / 60, eta % 60);
+    fflush(stdout);
+}
 
 static int shard_read_opcode(struct reader *rd)
 {
@@ -858,6 +930,9 @@ static void shard_one(struct shard_ctx *ctx, int i)
 
     for(;;)
     {
+        if(need_progress_update())
+            shard_progress_update(ctx);
+
         reader_pin(rd);
 
         int opcode = shard_read_opcode(rd);
@@ -868,9 +943,9 @@ static void shard_one(struct shard_ctx *ctx, int i)
             break;
         }
 
-        rdb_read_string(rd, &ctx->keyname, &ctx->keylen);
+        int keylen = rdb_read_string(rd, &ctx->keybuf, &ctx->keybuflen);
 
-        hash_t hash = ctx->hfn(ctx->keyname, ctx->keylen);
+        hash_t hash = hashfn_hash(ctx->hfn, ctx->keybuf, keylen);
         int shardidx = shardfn_dispatch(ctx->sfn, hash);
 
         struct writer *wr = &ctx->wr[shardidx];
@@ -883,22 +958,48 @@ static void shard_one(struct shard_ctx *ctx, int i)
 
 static void shard(struct shard_ctx *ctx)
 {
-    rdb_ver_t ver[ctx->rd_count];
-    for(int i=0; i<ctx->rd_count; i++) {
+    rdb_ver_t ver[ctx->rd_count],
+              maxver = 0;
+    
+    ctx->total_size = 0;
+
+    for(int i=0; i<ctx->rd_count; i++)
+    {
         ver[i] = rdb_check_header(&ctx->rd[i]);
         if(ver[i] > 6)
             failure("%s: rdb file version %d is not supported", ctx->rd[i].name, ver[i]);
+        if(ver[i] > maxver)
+            maxver = ver[i];
+        ctx->total_size += ctx->rd[i].total_size;
     }
 
-    for(int i=0; i<ctx->wr_count; i++)
-        rdb_write_header(&ctx->wr[i]);
+    if(!is_quiet())
+    {
+        char totalsize[16];
+        fmt_filesize(totalsize, ctx->total_size);
+        printf("%d input rdbs (%s); %d shards; hash %s; sharder %s; rdb version %d\n",
+                ctx->rd_count, totalsize, ctx->wr_count,
+                hashfn_name(ctx->hfn), shardfn_name(ctx->sfn),
+                maxver);
+        
+        if(-1 == gettimeofday(&ctx->start_time, NULL))
+            errmsg("gettimeofday: %m");
+
+        start_progress_timer();
+    }
+
+    int crc_enable = rdb_has_checksum(maxver);
+    for(int i=0; i<ctx->wr_count; i++) {
+        ctx->wr[i].crc_enable = crc_enable;
+        rdb_write_header(&ctx->wr[i], maxver);
+    }
 
     int db_ahead[ctx->rd_count];
     for(int i=0; i<ctx->rd_count; i++)
         db_ahead[i] = rdb_read_dbsel(&ctx->rd[i]);
 
-    ctx->keyname = NULL;
-    ctx->keylen = 0;
+    ctx->keybuf = NULL;
+    ctx->keybuflen = 0;
 
     for(;;)
     {
@@ -919,25 +1020,95 @@ static void shard(struct shard_ctx *ctx)
                 db_ahead[i] = rdb_read_dbsel(&ctx->rd[i]);
             }
     }
-
-    free(ctx->keyname);
+    
+    free(ctx->keybuf);
 
     for(int i=0; i<ctx->rd_count; i++)
         rdb_check_crc(&ctx->rd[i], ver[i]);
 
-    for(int i=0; i<ctx->wr_count; i++) {
+    for(int i=0; i<ctx->wr_count; i++)
+    {
         rdb_write_dbsel(&ctx->wr[i], -1);
-        rdb_write_crc(&ctx->wr[i]);
+        if(crc_enable)
+            rdb_write_crc(&ctx->wr[i]);
         writer_flush(&ctx->wr[i]);
+    }
+
+    if(!is_quiet()) {
+        stop_progress_timer();
+        printf("completed successfully.\n");
     }
 }
 
 /* ------------------------------------------------------------------------- */
 
+static int quiet = 0;
+static inline int is_quiet() {
+    return quiet;
+}
+
+static void fmt_filesize(char *buf, off_t size)
+{
+    if(size < 10000)
+        sprintf(buf, "%llu B", (unsigned long long)size);
+    else if(size < 1048576)
+        sprintf(buf, "%llu KB", (unsigned long long)size / 1024ULL);
+    else if(size < 100 * 1048576)
+        sprintf(buf, "%.2lf MB", (double)size / 1048576.);
+    else if(size < 1073741824)
+        sprintf(buf, "%.1lf MB", (double)size / 1048576.);
+    else 
+        sprintf(buf, "%.2lf GB", (double)size / 1073741824.);
+}
+
+
+static volatile int progress_update_flag;
+
+static void progress_timer_fn(int sig) {
+    (void) sig;
+    progress_update_flag = 1;
+    alarm(1);
+}
+static void start_progress_timer()
+{
+    struct sigaction sa;
+    sa.sa_handler = progress_timer_fn;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_restorer = NULL;
+
+    if(-1 == sigaction(SIGALRM, &sa, NULL))
+        errmsg("sigaction(SIGALRM): %m");
+
+    alarm(1);
+}
+static inline int need_progress_update()
+{
+    int x = progress_update_flag;
+    progress_update_flag = 0;
+    return x;
+}
+static void stop_progress_timer()
+{
+    alarm(0);
+
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sa.sa_sigaction = NULL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_restorer = NULL;
+
+    if(-1 == sigaction(SIGALRM, &sa, NULL))
+        errmsg("sigaction(SIGALRM): %m");
+
+    progress_update_flag = 0;
+}
+
 static void print_usage() __attribute__ ((noreturn));
 static void print_usage()
 {
-    fputs("Usage: rdbshard [-h hash] [-s sharder] -i input.rdb -o shardname\n"
+    fputs("Usage: rdbshard [-q] [-h hash] [-s sharder] -i input.rdb -o shardname\n"
           "\n"
           "rdbshard performs twemproxy (aka. nutcracker)-compatible sharding directly on Redis dump files.\n"
           "Multiple input files and output shards can be specified by repeating -i and -o options.\n"
@@ -968,14 +1139,15 @@ int main(int argc, char *argv[])
     int n_inputs = 0,
         n_nodes = 0;
 
-    const char *hashfn_name = default_hashfn->name,
-               *shardfn_name = default_shardfn->name;
+    const char *sel_hashfn = default_hashfn->name,
+               *sel_shardfn = default_shardfn->name;
 
     int opt;
-    while((opt = getopt(argc, argv, "h:s:i:o:")) != -1)
+    while((opt = getopt(argc, argv, "qh:s:i:o:")) != -1)
         switch(opt) {
-            case 'h': hashfn_name = optarg; break;
-            case 's': shardfn_name = optarg; break;
+            case 'q': quiet = 1; break;
+            case 'h': sel_hashfn = optarg; break;
+            case 's': sel_shardfn = optarg; break;
             case 'i': input_filenames[n_inputs++] = optarg; break;
             case 'o': node_names[n_nodes++] = optarg; break;
             default:  print_usage(); break;
@@ -986,18 +1158,18 @@ int main(int argc, char *argv[])
 
     struct shard_ctx ctx;
 
-    ctx.hfn = hashfn_init(hashfn_name);
+    ctx.hfn = hashfn_init(sel_hashfn);
     if(NULL == ctx.hfn) {
         int missing = ENOENT == errno;
-        errmsg("failed to initialize hash %s: hashfn_init: %m", hashfn_name);
+        errmsg("failed to initialize hash %s: hashfn_init: %m", sel_hashfn);
         if(missing) print_usage();
         exit(EXIT_FAILURE);
     }
 
-    ctx.sfn = shardfn_init(shardfn_name, node_names, n_nodes);
+    ctx.sfn = shardfn_init(sel_shardfn, node_names, n_nodes);
     if(NULL == ctx.sfn) {
         int missing = ENOENT == errno;
-        errmsg("failed to initialize sharder %s: shardfn_init: %m", shardfn_name);
+        errmsg("failed to initialize sharder %s: shardfn_init: %m", sel_shardfn);
         if(missing) print_usage();
         exit(EXIT_FAILURE);
     }
@@ -1016,6 +1188,9 @@ int main(int argc, char *argv[])
             failerr("failed to open input file %s: open", input_filenames[i]);
         if(-1 == reader_init(&rd[i], fd, input_filenames[i]))
             failerr("reader_init");
+
+        if(-1 == posix_fadvise(fd, 0,0, POSIX_FADV_SEQUENTIAL | POSIX_FADV_NOREUSE | POSIX_FADV_WILLNEED))
+            errmsg("posix_fadvise: %m");
     }
 
     for(int i=0; i<n_nodes; i++)
