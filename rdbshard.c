@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <endian.h>
 #include <time.h>
+#include <regex.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -261,6 +262,7 @@ struct writer
 {
     int fd;
     char *buf, *ptr, *mid, *end;
+    int mute;
     int crc_enable;
     uint64_t crc64;
 };
@@ -371,6 +373,7 @@ static int writer_init(struct writer *wr, int fd)
     wr->ptr = wr->buf;
     wr->mid = wr->buf + IO_BUFFER_SIZE;
     wr->end = wr->buf + 2*IO_BUFFER_SIZE;
+    wr->mute = 0;
     wr->crc_enable = 1;
     wr->crc64 = 0;
     return 0;
@@ -406,6 +409,9 @@ static int writer_flush(struct writer *wr)
 
 static int writer_write(struct writer *wr, const void *buf, size_t n)
 {
+    if(wr->mute)
+        return 0;
+
     if(wr->crc_enable)
         wr->crc64 = crc64(wr->crc64, buf, n);
 
@@ -793,7 +799,10 @@ struct shard_ctx
 {
     hashfn_t hfn;
     shardfn_t sfn;
-    
+
+    regex_t * const * exclude;
+    int exclude_count;
+
     int rd_count, wr_count;
     struct reader *rd;
     struct writer *wr;
@@ -928,10 +937,8 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
     }
 }
 
-static void shard_one(struct shard_ctx *ctx, int i)
+static void shard_one(struct shard_ctx *ctx, struct reader *rd)
 {
-    struct reader *rd = &ctx->rd[i];
-
     for(;;)
     {
         if(need_progress_update())
@@ -954,9 +961,17 @@ static void shard_one(struct shard_ctx *ctx, int i)
 
         struct writer *wr = &ctx->wr[shardidx];
 
+        for(int i=0; i<ctx->exclude_count; i++)
+            if(0 == regexec(ctx->exclude[i], ctx->keybuf, 0,NULL, 0)) {
+                wr->mute = 1;
+                break;
+            }
+
         if(-1 == xfer_pinned(rd, wr))
             failerr("xfer_pinned");
         shard_xfer(rd, wr, opcode);
+
+        wr->mute = 0;
     }
 }
 
@@ -1020,7 +1035,7 @@ static void shard(struct shard_ctx *ctx)
         
         for(int i=0; i<ctx->rd_count; i++)
             if(db_ahead[i] == min_db) {
-                shard_one(ctx, i);
+                shard_one(ctx, &ctx->rd[i]);
                 db_ahead[i] = rdb_read_dbsel(&ctx->rd[i]);
             }
     }
@@ -1113,14 +1128,22 @@ static void stop_progress_timer()
 static void print_usage() __attribute__ ((noreturn));
 static void print_usage()
 {
-    fputs("Usage: rdbshard [-q] [-h hash] [-s sharder] -i input.rdb -o shardname\n"
+    fputs("Usage: rdbshard [options] -i input1.rdb input2.rdb ... -o shard1 shard2 ...\n"
           "\n"
-          "rdbshard performs twemproxy (aka. nutcracker)-compatible sharding directly on Redis dump files.\n"
-          "Multiple input files and output shards can be specified by repeating -i and -o options.\n"
-          "Shards will be saved to files [shardname].rdb, which must not exist.\n",
+          "rdbshard performs twemproxy (aka. nutcracker)-compatible sharding directly\n"
+          "on Redis dump files. Multiple input files and output shards can be specified\n"
+          "after -i and -o options respectively. Shards will be saved to files\n"
+          "[shardname].rdb, which must not exist. Please note that shard names must be\n"
+          "exactly the same as in twemproxy configuration.\n"
+          "\n"
+          "Options:\n"
+          "    -q            quiet operation (no progress bar etc)\n"
+          "    -h [hashfn]   select hash\n"
+          "    -s [shardfn]  select sharder\n"
+          "    -x [regexp]   exclude keys matching given posix extended regexp\n",
           stderr);
 
-    fputs("\navailable hashes [-h] (* is default): ", stderr);
+    fputs("available hashes [-h] (* is default): ", stderr);
     for(int i=0; all_hashfns[i]; i++)
         fprintf(stderr, " %s%s",
                 default_hashfn == all_hashfns[i] ? "*" : "",
@@ -1136,27 +1159,60 @@ static void print_usage()
     exit(EXIT_FAILURE);
 }
 
+static regex_t *compile_regex(const char *str)
+{
+    regex_t *ret = malloc(sizeof(regex_t));
+    if(NULL == ret)
+        failerr("malloc");
+
+    int rc = regcomp(ret, str, REG_NOSUB | REG_EXTENDED);
+    if(0 == rc)
+        return ret;
+
+    char errbuf[128];
+    regerror(rc, ret, errbuf, sizeof(errbuf));
+    failure("failed to compile -x regexp: %s", errbuf);
+}
+
+static void free_regex(regex_t *re) {
+    free(re);
+}
+
 int main(int argc, char *argv[])
 {
     const char *input_filenames[argc],
                *node_names[argc];
+    regex_t *exclude_regexs[argc];
 
     int n_inputs = 0,
-        n_nodes = 0;
+        n_nodes = 0,
+        n_excludes = 0;
 
     const char *sel_hashfn = default_hashfn->name,
                *sel_shardfn = default_shardfn->name;
 
-    int opt;
-    while((opt = getopt(argc, argv, "qh:s:i:o:")) != -1)
+    int opt, io_opt = '?';
+    while((opt = getopt(argc, argv, "-qh:s:x:io")) != -1)
+    {
+        if('i' == opt || 'o' == opt) {
+            io_opt = opt;
+            continue;
+        }
+        if(1 == opt)
+            opt = io_opt;
+        else
+            io_opt = '?';
+
         switch(opt) {
             case 'q': quiet = 1; break;
             case 'h': sel_hashfn = optarg; break;
             case 's': sel_shardfn = optarg; break;
+            case 'x': exclude_regexs[n_excludes++] = compile_regex(optarg); break;
             case 'i': input_filenames[n_inputs++] = optarg; break;
             case 'o': node_names[n_nodes++] = optarg; break;
             default:  print_usage(); break;
         }
+    }
 
     if(0 == n_inputs || 0 == n_nodes)
         print_usage();
@@ -1178,6 +1234,9 @@ int main(int argc, char *argv[])
         if(missing) print_usage();
         exit(EXIT_FAILURE);
     }
+
+    ctx.exclude = exclude_regexs;
+    ctx.exclude_count = n_excludes;
 
     struct reader rd[n_inputs];
     struct writer wr[n_nodes];
@@ -1221,6 +1280,9 @@ int main(int argc, char *argv[])
         reader_free(&rd[i]);
         close(rd[i].fd);
     }
+
+    for(int i=0; i<n_excludes; i++)
+        free_regex(exclude_regexs[i]);
 
     shardfn_free(ctx.sfn);
 
