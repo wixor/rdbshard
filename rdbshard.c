@@ -637,7 +637,7 @@ static void rdb_check_crc(struct reader *rd, rdb_ver_t ver)
         reader_advance(rd, 8);
         rc -= 8;
         if(0 != rd->crc64) {
-            errmsg("%s: rdb tail corrupted (invalid checksum; residuum: %016llX)", rd->name, rd->crc64);
+            errmsg("%s: rdb tail corrupted (invalid checksum; residuum: %016lX)", rd->name, rd->crc64);
             return;
         }
     }
@@ -933,6 +933,7 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
         case REDIS_RDB_TYPE_ZSET:
         case REDIS_RDB_TYPE_HASH:
             mult = 2;
+            __attribute__ ((fallthrough));
         case REDIS_RDB_TYPE_LIST:
         case REDIS_RDB_TYPE_SET:
             reader_pin(rd);
