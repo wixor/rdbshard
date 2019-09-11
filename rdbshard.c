@@ -529,11 +529,14 @@ static int funnyint_parse(const void *b, int len, uint32_t *out, int *special)
             *special = 0;
             return 2;
         case REDIS_RDB_32BITLEN:
-            if(len < 5) return -1;
-            memcpy(&x, buf+1, 4);
-            *out = be32toh(x);
-            *special = 0;
-            return 5;
+            if(buf[0] == 0x80) {
+                if(len < 5) return -1;
+                memcpy(&x, buf+1, 4);
+                *out = be32toh(x);
+                *special = 0;
+                return 5;
+            }
+            break;
         case REDIS_RDB_ENCVAL:
             *out = buf[0] & 0x3f;
             *special = 1;
