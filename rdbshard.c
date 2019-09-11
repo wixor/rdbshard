@@ -491,11 +491,13 @@ enum {
     REDIS_RDB_TYPE_SET = 2,
     REDIS_RDB_TYPE_ZSET = 3,
     REDIS_RDB_TYPE_HASH = 4,
+    REDIS_RDB_TYPE_ZSET_2 = 5,
     REDIS_RDB_TYPE_HASH_ZIPMAP = 9,
     REDIS_RDB_TYPE_LIST_ZIPLIST = 10,
     REDIS_RDB_TYPE_SET_INTSET = 11,
     REDIS_RDB_TYPE_ZSET_ZIPLIST = 12,
     REDIS_RDB_TYPE_HASH_ZIPLIST = 13,
+    REDIS_RDB_TYPE_LIST_QUICKLIST = 14,
 
     REDIS_RDB_ENC_INT8 = 0,
     REDIS_RDB_ENC_INT16 = 1,
@@ -939,6 +941,8 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
             __attribute__ ((fallthrough));
         case REDIS_RDB_TYPE_LIST:
         case REDIS_RDB_TYPE_SET:
+        case REDIS_RDB_TYPE_LIST_QUICKLIST:
+        case REDIS_RDB_TYPE_ZSET_2:
             reader_pin(rd);
             if(-1 == funnyint_read(rd, &stringcnt, &special))
                 failerr("funnyint_read");
@@ -967,6 +971,14 @@ static void shard_xfer(struct reader *rd, struct writer *wr, int opcode)
             failerr("xfer_bytes");
         if((size_t)rc != fmt.encbytes)
             failure("%s: truncated rdb file (object data)", rd->name);
+
+        if(opcode == REDIS_RDB_TYPE_ZSET_2) {
+            rc = xfer_bytes(rd, wr, 8);
+            if(-1 == rc)
+                failerr("xfer_bytes");
+            if((size_t)rc != 8)
+                failure("%s: truncated rdb file (object data)", rd->name);
+        }
     }
 }
 
